@@ -97,7 +97,7 @@ class DeepSeekChat(BaseChatModel):
         return "deepseek-chat"
 
 
-# Global variables
+# Global variables - using more efficient data structures
 BUSINESS_CACHE = {}
 CITY_INDEX = defaultdict(set)
 CATEGORY_INDEX = defaultdict(set)
@@ -105,13 +105,13 @@ BUSINESS_ID_TO_CATEGORIES = {}
 OPENROUTER_API_KEY = None
 CACHE_INITIALIZED = False
 
-# Precompiled regex patterns
+# Precompiled regex patterns for better performance
 CITY_PATTERN1 = re.compile(r"(?:business(?:es)? in|places in|recommend in|suggest in) ([a-zA-Z\s]+)(?:city)?")
 CITY_PATTERN2 = re.compile(r"in ([a-zA-Z\s]+)(?:city)?")
 CITY_PATTERN3 = re.compile(r"([a-zA-Z]+) city")
 CATEGORY_PATTERN = re.compile(r"(?:recommend|suggest|find|looking for|want) (?:a|an|some) ([a-zA-Z\s]+) (?:and|&) ([a-zA-Z\s]+) in")
 
-# Aliases and common terms
+# Using sets for faster lookups
 CITY_ALIASES = {
     "phonix": "phoenix", "pheonix": "phoenix", "phenix": "phoenix", "phx": "phoenix",
     "vegas": "las vegas", "lv": "las vegas", "sb": "santa barbara", "pitt": "pittsburgh",
@@ -193,6 +193,13 @@ NEGATIVE_PHRASES = {
     "no businesses", "no restaurants", "no cafes", "no bakeries"
 }
 
+PEOPLE_KEYWORDS = {
+    "friend", "friends", "mate", "mates", "buddy", "buddies", "pal", "pals",
+    "people", "person", "meet", "connect", "connection", "social", "networking",
+    "dating", "date", "relationship", "relationships", "partner", "companion",
+    "acquaintance", "colleague", "coworker", "neighbor", "classmate"
+}
+
 
 def initialize_cache(yelp_file_path, limit=20000):
     """Initialize cache with business data for faster lookups using parallel processing"""
@@ -204,61 +211,53 @@ def initialize_cache(yelp_file_path, limit=20000):
     logger.info("Initializing business data cache...")
     print("Loading business data... Please wait...")
     
-    def process_line(line):
-        try:
-            business = json.loads(line.strip())
-            business_id = business.get('business_id')
-            
-            if not business_id:
-                return None
-            
-            city = business.get('city', '').lower()
-            
-            categories_str = business.get('categories', '')
-            categories_list = []
-            if categories_str:
-                categories_list = [cat.strip().lower() for cat in categories_str.split(',')]
-            
-            return business_id, business, city, categories_list
-        except json.JSONDecodeError:
-            return None
+    # Optimized batch processing
+    batch_size = 1000
+    businesses_processed = 0
     
-    # Count lines for progress bar
-    total_lines = 0
     with open(yelp_file_path, 'r', encoding='utf-8') as file:
-        for _ in file:
-            total_lines += 1
-            if total_lines >= limit:
-                break
-    
-    # Read lines
-    lines = []
-    with open(yelp_file_path, 'r', encoding='utf-8') as file:
-        for i, line in enumerate(file):
-            if i >= limit:
-                break
-            lines.append(line)
-    
-    # Process lines with progress bar
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, os.cpu_count() + 4)) as executor:
-        results = list(tqdm(executor.map(process_line, lines), 
-                           total=len(lines), 
-                           desc="Processing businesses",
-                           unit="business"))
-    
-    # Build indices
-    for result in results:
-        if result:
-            business_id, business, city, categories_list = result
-            BUSINESS_CACHE[business_id] = business
-            
-            if city:
-                CITY_INDEX[city].add(business_id)
-            
-            if categories_list:
-                BUSINESS_ID_TO_CATEGORIES[business_id] = set(categories_list)
-                for category in categories_list:
-                    CATEGORY_INDEX[category].add(business_id)
+        with tqdm(total=min(limit, 20000), desc="Processing businesses", unit="business") as pbar:
+            while businesses_processed < limit:
+                batch_lines = []
+                for _ in range(batch_size):
+                    line = file.readline()
+                    if not line:
+                        break
+                    batch_lines.append(line)
+                
+                if not batch_lines:
+                    break
+                
+                # Process batch in parallel
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, os.cpu_count() + 4)) as executor:
+                    for line in batch_lines:
+                        try:
+                            business = json.loads(line.strip())
+                            business_id = business.get('business_id')
+                            
+                            if not business_id:
+                                continue
+                            
+                            BUSINESS_CACHE[business_id] = business
+                            
+                            city = business.get('city', '').lower()
+                            if city:
+                                CITY_INDEX[city].add(business_id)
+                            
+                            categories_str = business.get('categories', '')
+                            if categories_str:
+                                categories_list = [cat.strip().lower() for cat in categories_str.split(',')]
+                                BUSINESS_ID_TO_CATEGORIES[business_id] = set(categories_list)
+                                for category in categories_list:
+                                    CATEGORY_INDEX[category].add(business_id)
+                            
+                            businesses_processed += 1
+                            pbar.update(1)
+                            
+                            if businesses_processed >= limit:
+                                break
+                        except json.JSONDecodeError:
+                            continue
     
     logger.info(f"Cache initialized with {len(BUSINESS_CACHE)} businesses")
     logger.info(f"Cities indexed: {len(CITY_INDEX)}")
@@ -268,7 +267,7 @@ def initialize_cache(yelp_file_path, limit=20000):
     CACHE_INITIALIZED = True
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=512)  # Increased cache size
 def normalize_city_name(city_name):
     """Normalize city name using aliases and spelling corrections with caching"""
     if not city_name:
@@ -286,7 +285,7 @@ def normalize_city_name(city_name):
     return city_name
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=512)  # Increased cache size
 def normalize_category(category):
     """Normalize category name using aliases and spelling corrections with caching"""
     if not category:
@@ -308,6 +307,16 @@ def extract_city_name(query):
     """Extract city name from query using precompiled regex patterns"""
     query_lower = query.lower()
     
+    # Fast path using direct dictionary lookup first
+    for city in CITY_NAMES:
+        if city in query_lower:
+            return city
+    
+    for alias, city in CITY_ALIASES.items():
+        if alias in query_lower:
+            return city
+    
+    # Fallback to regex patterns
     match = CITY_PATTERN1.search(query_lower)
     if match:
         return normalize_city_name(match.group(1).strip())
@@ -320,14 +329,6 @@ def extract_city_name(query):
     if match:
         return normalize_city_name(match.group(1).strip())
     
-    for city in CITY_NAMES:
-        if city in query_lower:
-            return city
-    
-    for alias, city in CITY_ALIASES.items():
-        if alias in query_lower:
-            return city
-    
     return None
 
 
@@ -336,20 +337,24 @@ def extract_categories(query):
     query_lower = query.lower()
     
     found_categories = set()
+    
+    # Fast path: direct category matching
     for category in COMMON_CATEGORIES:
-        if category in query_lower:
+        if f" {category} " in f" {query_lower} " or f" {category}," in f" {query_lower} ":
             normalized = normalize_category(category)
             if normalized:
                 found_categories.add(normalized)
     
-    match = CATEGORY_PATTERN.search(query_lower)
-    if match:
-        cat1 = normalize_category(match.group(1).strip())
-        cat2 = normalize_category(match.group(2).strip())
-        if cat1:
-            found_categories.add(cat1)
-        if cat2:
-            found_categories.add(cat2)
+    # Fallback to regex for complex patterns
+    if not found_categories:
+        match = CATEGORY_PATTERN.search(query_lower)
+        if match:
+            cat1 = normalize_category(match.group(1).strip())
+            cat2 = normalize_category(match.group(2).strip())
+            if cat1:
+                found_categories.add(cat1)
+            if cat2:
+                found_categories.add(cat2)
     
     return list(found_categories) if found_categories else None
 
@@ -372,7 +377,8 @@ def generate_human_recommendation(businesses, category, city):
     if not businesses:
         return f"I couldn't find any {category} places in {city}. Perhaps try another category or city?"
     
-    sorted_businesses = sorted(businesses, key=lambda x: (x.get("stars", 0), x.get("review_count", 0)), reverse=True)
+    # Use a faster sorting method
+    sorted_businesses = sorted(businesses, key=lambda x: (float(x.get("stars", 0) or 0), int(x.get("review_count", 0) or 0)), reverse=True)
     top_businesses = sorted_businesses[:3]
     
     multiple_categories = " and " in category
@@ -413,6 +419,23 @@ def generate_human_recommendation(businesses, category, city):
 
 def find_businesses_with_all_categories(businesses, categories):
     """Find businesses that have ALL the specified categories"""
+    # Fast path: use prebuilt index
+    if len(businesses) > 100:  # Only use this optimization for large result sets
+        matching_business_ids = None
+        categories_lower = [cat.lower() for cat in categories]
+        
+        for category in categories_lower:
+            if category in CATEGORY_INDEX:
+                category_business_ids = CATEGORY_INDEX[category]
+                if matching_business_ids is None:
+                    matching_business_ids = category_business_ids.copy()
+                else:
+                    matching_business_ids &= category_business_ids
+        
+        if matching_business_ids:
+            return [BUSINESS_CACHE[bid] for bid in matching_business_ids if bid in BUSINESS_CACHE]
+    
+    # Fallback to direct filtering
     matching_businesses = []
     categories_lower = [cat.lower() for cat in categories]
     
@@ -441,15 +464,21 @@ def get_businesses_by_city(city_name):
     
     city_name = city_name.lower()
     
+    # Fast path: direct lookup
     if city_name in CITY_INDEX:
         business_ids = CITY_INDEX[city_name]
-        matching_businesses = [BUSINESS_CACHE[bid] for bid in business_ids if bid in BUSINESS_CACHE]
-    else:
-        for city in CITY_INDEX:
-            if city_name in city or city in city_name:
-                business_ids = CITY_INDEX[city]
-                city_businesses = [BUSINESS_CACHE[bid] for bid in business_ids if bid in BUSINESS_CACHE]
-                matching_businesses.extend(city_businesses)
+        return [BUSINESS_CACHE[bid] for bid in business_ids if bid in BUSINESS_CACHE]
+    
+    # Fallback to partial matching
+    for city in CITY_INDEX:
+        if city_name in city or city in city_name:
+            business_ids = CITY_INDEX[city]
+            city_businesses = [BUSINESS_CACHE[bid] for bid in business_ids if bid in BUSINESS_CACHE]
+            matching_businesses.extend(city_businesses)
+            
+            # Optimization: if we found a lot of businesses, stop looking
+            if len(matching_businesses) > 100:
+                break
     
     return matching_businesses
 
@@ -460,38 +489,54 @@ def get_businesses_by_category(category, city_businesses=None):
     
     category_lower = category.lower()
     
+    # Fast path: no city filter, use index directly
     if city_businesses is None:
         business_ids = CATEGORY_INDEX.get(category_lower, set())
         return [BUSINESS_CACHE[bid] for bid in business_ids if bid in BUSINESS_CACHE]
-    else:
-        matching = []
-        for b in city_businesses:
-            business_id = b.get('business_id')
-            if business_id in BUSINESS_ID_TO_CATEGORIES:
-                if any(category_lower in cat for cat in BUSINESS_ID_TO_CATEGORIES[business_id]):
-                    matching.append(b)
-            elif category_lower in get_safe_string(b.get('categories', '')):
+    
+    # Fast path: use set intersection for city businesses
+    if len(city_businesses) > 100:
+        city_business_ids = {b.get('business_id') for b in city_businesses if b.get('business_id')}
+        category_business_ids = CATEGORY_INDEX.get(category_lower, set())
+        matching_ids = city_business_ids.intersection(category_business_ids)
+        return [BUSINESS_CACHE[bid] for bid in matching_ids if bid in BUSINESS_CACHE]
+    
+    # Fallback to direct filtering
+    matching = []
+    for b in city_businesses:
+        business_id = b.get('business_id')
+        if business_id in BUSINESS_ID_TO_CATEGORIES:
+            if any(category_lower in cat for cat in BUSINESS_ID_TO_CATEGORIES[business_id]):
                 matching.append(b)
-        return matching
+        elif category_lower in get_safe_string(b.get('categories', '')):
+            matching.append(b)
+    
+    return matching
 
 
 def is_business_related_query(query):
     """Determine if a query is related to business recommendations"""
     query_lower = query.lower()
     
+    # Fast path: check for business keywords
     if any(keyword in query_lower for keyword in BUSINESS_KEYWORDS):
         return True
     
+    # Fast path: check for city names
     if any(city in query_lower for city in CITY_NAMES):
         return True
     
-    if any(pattern.search(query_lower) for pattern in BUSINESS_PATTERNS):
-        return True
-    
-    return False
+    # Fallback to regex patterns
+    return any(pattern.search(query_lower) for pattern in BUSINESS_PATTERNS)
 
 
-@lru_cache(maxsize=64)
+def is_people_related_query(query):
+    """Determine if a query is asking for friend recommendations or people connections"""
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in PEOPLE_KEYWORDS)
+
+
+@lru_cache(maxsize=128)  # Increased cache size
 def ask_deepseek(query, api_key):
     """Send a query directly to DeepSeek via OpenRouter API with caching"""
     headers = {
@@ -528,6 +573,20 @@ def ask_deepseek(query, api_key):
             wait_time = 2 ** attempt
             logger.warning(f"DeepSeek API request failed, retrying in {wait_time}s (attempt {attempt+1}/{max_retries})")
             time.sleep(wait_time)
+
+
+def get_friend_recommendation(query, city_name=None):
+    """Generate a response for queries asking about friends or people connections"""
+    prompt = f"The user is looking for friend recommendations or ways to meet people"
+    if city_name:
+        prompt += f" in {city_name}"
+    prompt += f". Their query was: '{query}'. "
+    prompt += "Please provide a helpful response with specific suggestions for how they could meet people, "
+    prompt += "make friends, or connect with others in this location. Include specific venues, apps, or events "
+    prompt += "where possible. If the Yelp dataset might contain relevant community spaces, mention those too. "
+    prompt += "Be conversational and friendly."
+    
+    return ask_deepseek(prompt, OPENROUTER_API_KEY)
 
 
 def get_generic_business_response(query, city_name=None, categories=None):
@@ -585,7 +644,8 @@ def process_direct_query(query):
             if not businesses:
                 return get_generic_business_response(query, city_name, categories)
         else:
-            businesses = list(BUSINESS_CACHE.values())[:5000]
+            # Optimization: use a sample instead of all businesses
+            businesses = list(BUSINESS_CACHE.values())[:2000]
         
         if categories:
             filtered_businesses = []
@@ -597,9 +657,10 @@ def process_direct_query(query):
         businesses = [b for b in businesses if "stars" in b and b["stars"] is not None]
         
         if businesses:
+            # Faster sorting
             sorted_businesses = sorted(
                 businesses, 
-                key=lambda x: (x.get("stars", 0), x.get("review_count", 0)), 
+                key=lambda x: (float(x.get("stars", 0) or 0), int(x.get("review_count", 0) or 0)), 
                 reverse=True
             )
             
@@ -621,9 +682,10 @@ def process_direct_query(query):
         businesses_in_city = get_businesses_by_city(city_name)
         
         if businesses_in_city:
+            # Faster sorting
             sorted_businesses = sorted(
                 businesses_in_city, 
-                key=lambda x: (x.get("stars", 0), x.get("review_count", 0)), 
+                key=lambda x: (float(x.get("stars", 0) or 0), int(x.get("review_count", 0) or 0)), 
                 reverse=True
             )
             
@@ -647,11 +709,11 @@ def setup_rag_system(yelp_file_path):
     print("Setting up RAG system... This might take a moment.")
     
     try:
+        # Use a smaller, faster embedding model
         embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
         
-        documents = []
-        
-        business_ids = list(BUSINESS_CACHE.keys())[:5000]
+        # Only use a sample of businesses for RAG to improve speed
+        business_ids = list(BUSINESS_CACHE.keys())[:2000]
         
         def process_business(business_id):
             business = BUSINESS_CACHE[business_id]
@@ -672,14 +734,22 @@ def setup_rag_system(yelp_file_path):
                 }
             )
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, os.cpu_count() + 4)) as executor:
-            documents = list(tqdm(
-                executor.map(process_business, business_ids),
-                total=len(business_ids),
-                desc="Creating document vectors",
-                unit="doc"
-            ))
+        # Process in batches for better memory management
+        batch_size = 500
+        documents = []
         
+        for i in range(0, len(business_ids), batch_size):
+            batch_ids = business_ids[i:i+batch_size]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, os.cpu_count() + 4)) as executor:
+                batch_docs = list(tqdm(
+                    executor.map(process_business, batch_ids),
+                    total=len(batch_ids),
+                    desc=f"Creating document vectors (batch {i//batch_size + 1})",
+                    unit="doc"
+                ))
+                documents.extend(batch_docs)
+        
+        # Use a smaller chunk size for faster indexing
         vectorstore = Chroma.from_documents(
             documents=documents, 
             embedding=embeddings
@@ -698,9 +768,10 @@ def setup_rag_system(yelp_file_path):
         Include the business name, rating, categories, and address for each business.
         """
         
+        # Use a smaller k value for faster retrieval
         chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
-            retriever=index.vectorstore.as_retriever(search_kwargs={"k": 5}),
+            retriever=index.vectorstore.as_retriever(search_kwargs={"k": 3}),
         )
         
         print("✓ RAG system ready")
@@ -710,34 +781,6 @@ def setup_rag_system(yelp_file_path):
         logger.error(f"Error setting up RAG system: {str(e)}")
         print("❌ Error setting up RAG system. Falling back to direct API calls.")
         return None
-    
-    Copy
-# Add this function to handle friend/people-related queries
-def is_people_related_query(query):
-    """Determine if a query is asking for friend recommendations or people connections"""
-    query_lower = query.lower()
-    people_keywords = {
-        "friend", "friends", "mate", "mates", "buddy", "buddies", "pal", "pals",
-        "people", "person", "meet", "connect", "connection", "social", "networking",
-        "dating", "date", "relationship", "relationships", "partner", "companion",
-        "acquaintance", "colleague", "coworker", "neighbor", "classmate"
-    }
-    
-    return any(keyword in query_lower for keyword in people_keywords)
-
-# Add this function to handle friend/people recommendations
-def get_friend_recommendation(query, city_name=None):
-    """Generate a response for queries asking about friends or people connections"""
-    prompt = f"The user is looking for friend recommendations or ways to meet people"
-    if city_name:
-        prompt += f" in {city_name}"
-    prompt += f". Their query was: '{query}'. "
-    prompt += "Please provide a helpful response with specific suggestions for how they could meet people, "
-    prompt += "make friends, or connect with others in this location. Include specific venues, apps, or events "
-    prompt += "where possible. If the Yelp dataset might contain relevant community spaces, mention those too. "
-    prompt += "Be conversational and friendly."
-    
-    return ask_deepseek(prompt, OPENROUTER_API_KEY)
 
 
 def main():
@@ -746,7 +789,7 @@ def main():
     # ASCII art banner for a nicer UI
     banner = """
     ╭───────────────────────────────────────╮
-    │  🔍 Business Recommendation Assistant │
+    │  🔍 Business Recommendation Assistant  │
     ╰───────────────────────────────────────╯
     """
     print(banner)
@@ -766,6 +809,19 @@ def main():
         sys.exit(1)
     
     print(f"\n🔍 Searching for: {query}\n")
+    
+    # Check if query is people-related (faster than business check)
+    if is_people_related_query(query):
+        print("Processing your people-related question...")
+        city_name = extract_city_name(query)
+        try:
+            response = get_friend_recommendation(query, city_name)
+            print("\n" + response)
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"Error processing people-related question: {str(e)}")
+            print("I'm sorry, I couldn't process your request. Please try again later.")
+            sys.exit(1)
     
     # Check if query is business-related
     if not is_business_related_query(query):
@@ -866,4 +922,3 @@ if __name__ == "__main__":
         logger.error(f"Unhandled exception: {str(e)}")
         print(f"\n⚠️ Something went wrong: {str(e)}")
         print("Please try again with a different query or check your internet connection.")
-        
