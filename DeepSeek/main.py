@@ -1,5 +1,4 @@
 import os
-import sys
 import requests
 import json
 import warnings
@@ -14,7 +13,7 @@ from tqdm import tqdm
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# Configure logging
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -30,7 +29,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 
-# Initialize Flask app
+
 app = Flask(__name__)
 CORS(app)
 
@@ -46,8 +45,7 @@ class DeepSeekChat(BaseChatModel):
     ) -> ChatResult:
         headers = {
             "Authorization": f"Bearer {self.openrouter_api_key}",
-            "HTTP-Referer": "https://yourapp.com",
-            "X-Title": "LangChain RAG Application",
+            "X-Title": "Fork and Friends Chatbot",
             "Content-Type": "application/json"
         }
         
@@ -103,22 +101,22 @@ class DeepSeekChat(BaseChatModel):
         return "deepseek-chat"
 
 
-# Global variables - using more efficient data structures
+
 BUSINESS_CACHE = {}
 CITY_INDEX = defaultdict(set)
 CATEGORY_INDEX = defaultdict(set)
 BUSINESS_ID_TO_CATEGORIES = {}
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "default_api_key")
 CACHE_INITIALIZED = False
 RAG_CHAIN = None
 
-# Precompiled regex patterns for better performance
+
 CITY_PATTERN1 = re.compile(r"(?:business(?:es)? in|places in|recommend in|suggest in) ([a-zA-Z\s]+)(?:city)?")
 CITY_PATTERN2 = re.compile(r"in ([a-zA-Z\s]+)(?:city)?")
 CITY_PATTERN3 = re.compile(r"([a-zA-Z]+) city")
 CATEGORY_PATTERN = re.compile(r"(?:recommend|suggest|find|looking for|want) (?:a|an|some) ([a-zA-Z\s]+) (?:and|&) ([a-zA-Z\s]+) in")
 
-# Using sets for faster lookups
+
 CITY_ALIASES = {
     "phonix": "phoenix", "pheonix": "phoenix", "phenix": "phoenix", "phx": "phoenix",
     "vegas": "las vegas", "lv": "las vegas", "sb": "santa barbara", "pitt": "pittsburgh",
@@ -145,7 +143,7 @@ COMMON_CATEGORIES = {
     "park", "playground", "zoo", "aquarium", "nightlife", "club", "dance"
 }
 
-# Add aliases to common categories
+
 for alias in CATEGORY_ALIASES:
     COMMON_CATEGORIES.add(alias)
 
@@ -167,7 +165,7 @@ BUSINESS_KEYWORDS = {
     "gym", "fitness", "hotel", "motel", "lodging", "stay", "accommodation"
 }
 
-# Add aliases to business keywords
+
 for alias in CATEGORY_ALIASES:
     BUSINESS_KEYWORDS.add(alias)
 
@@ -178,7 +176,7 @@ CITY_NAMES = {
     "fort worth", "columbus", "san francisco", "seattle", "denver", "boston"
 }
 
-# Add aliases to city names
+
 for alias in CITY_ALIASES:
     CITY_NAMES.add(alias)
 
@@ -217,7 +215,7 @@ def initialize_cache(yelp_file_path, limit=20000):
     
     logger.info("Initializing business data cache...")
     
-    # Optimized batch processing
+    
     batch_size = 1000
     businesses_processed = 0
     
@@ -234,7 +232,7 @@ def initialize_cache(yelp_file_path, limit=20000):
                 if not batch_lines:
                     break
                 
-                # Process batch in parallel
+                
                 with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, os.cpu_count() + 4)) as executor:
                     for line in batch_lines:
                         try:
@@ -272,7 +270,7 @@ def initialize_cache(yelp_file_path, limit=20000):
     CACHE_INITIALIZED = True
 
 
-@lru_cache(maxsize=512)  # Increased cache size
+@lru_cache(maxsize=512)  
 def normalize_city_name(city_name):
     """Normalize city name using aliases and spelling corrections with caching"""
     if not city_name:
@@ -290,7 +288,7 @@ def normalize_city_name(city_name):
     return city_name
 
 
-@lru_cache(maxsize=512)  # Increased cache size
+@lru_cache(maxsize=512)  
 def normalize_category(category):
     """Normalize category name using aliases and spelling corrections with caching"""
     if not category:
@@ -312,7 +310,7 @@ def extract_city_name(query):
     """Extract city name from query using precompiled regex patterns"""
     query_lower = query.lower()
     
-    # Fast path using direct dictionary lookup first
+    
     for city in CITY_NAMES:
         if city in query_lower:
             return city
@@ -321,7 +319,7 @@ def extract_city_name(query):
         if alias in query_lower:
             return city
     
-    # Fallback to regex patterns
+    
     match = CITY_PATTERN1.search(query_lower)
     if match:
         return normalize_city_name(match.group(1).strip())
@@ -343,14 +341,14 @@ def extract_categories(query):
     
     found_categories = set()
     
-    # Fast path: direct category matching
+    
     for category in COMMON_CATEGORIES:
         if f" {category} " in f" {query_lower} " or f" {category}," in f" {query_lower} ":
             normalized = normalize_category(category)
             if normalized:
                 found_categories.add(normalized)
     
-    # Fallback to regex for complex patterns
+    
     if not found_categories:
         match = CATEGORY_PATTERN.search(query_lower)
         if match:
@@ -382,7 +380,7 @@ def generate_human_recommendation(businesses, category, city):
     if not businesses:
         return f"I couldn't find any {category} places in {city}. Perhaps try another category or city?"
     
-    # Use a faster sorting method
+    
     sorted_businesses = sorted(businesses, key=lambda x: (float(x.get("stars", 0) or 0), int(x.get("review_count", 0) or 0)), reverse=True)
     top_businesses = sorted_businesses[:3]
     
@@ -424,8 +422,8 @@ def generate_human_recommendation(businesses, category, city):
 
 def find_businesses_with_all_categories(businesses, categories):
     """Find businesses that have ALL the specified categories"""
-    # Fast path: use prebuilt index
-    if len(businesses) > 100:  # Only use this optimization for large result sets
+    
+    if len(businesses) > 100:  
         matching_business_ids = None
         categories_lower = [cat.lower() for cat in categories]
         
@@ -440,7 +438,7 @@ def find_businesses_with_all_categories(businesses, categories):
         if matching_business_ids:
             return [BUSINESS_CACHE[bid] for bid in matching_business_ids if bid in BUSINESS_CACHE]
     
-    # Fallback to direct filtering
+    
     matching_businesses = []
     categories_lower = [cat.lower() for cat in categories]
     
@@ -469,19 +467,19 @@ def get_businesses_by_city(city_name):
     
     city_name = city_name.lower()
     
-    # Fast path: direct lookup
+    
     if city_name in CITY_INDEX:
         business_ids = CITY_INDEX[city_name]
         return [BUSINESS_CACHE[bid] for bid in business_ids if bid in BUSINESS_CACHE]
     
-    # Fallback to partial matching
+    
     for city in CITY_INDEX:
         if city_name in city or city in city_name:
             business_ids = CITY_INDEX[city]
             city_businesses = [BUSINESS_CACHE[bid] for bid in business_ids if bid in BUSINESS_CACHE]
             matching_businesses.extend(city_businesses)
             
-            # Optimization: if we found a lot of businesses, stop looking
+            
             if len(matching_businesses) > 100:
                 break
     
@@ -494,19 +492,19 @@ def get_businesses_by_category(category, city_businesses=None):
     
     category_lower = category.lower()
     
-    # Fast path: no city filter, use index directly
+    
     if city_businesses is None:
         business_ids = CATEGORY_INDEX.get(category_lower, set())
         return [BUSINESS_CACHE[bid] for bid in business_ids if bid in BUSINESS_CACHE]
     
-    # Fast path: use set intersection for city businesses
+    
     if len(city_businesses) > 100:
         city_business_ids = {b.get('business_id') for b in city_businesses if b.get('business_id')}
         category_business_ids = CATEGORY_INDEX.get(category_lower, set())
         matching_ids = city_business_ids.intersection(category_business_ids)
         return [BUSINESS_CACHE[bid] for bid in matching_ids if bid in BUSINESS_CACHE]
     
-    # Fallback to direct filtering
+    
     matching = []
     for b in city_businesses:
         business_id = b.get('business_id')
@@ -523,15 +521,15 @@ def is_business_related_query(query):
     """Determine if a query is related to business recommendations"""
     query_lower = query.lower()
     
-    # Fast path: check for business keywords
+    
     if any(keyword in query_lower for keyword in BUSINESS_KEYWORDS):
         return True
     
-    # Fast path: check for city names
+    
     if any(city in query_lower for city in CITY_NAMES):
         return True
     
-    # Fallback to regex patterns
+    
     return any(pattern.search(query_lower) for pattern in BUSINESS_PATTERNS)
 
 
@@ -541,7 +539,7 @@ def is_people_related_query(query):
     return any(keyword in query_lower for keyword in PEOPLE_KEYWORDS)
 
 
-@lru_cache(maxsize=128)  # Increased cache size
+@lru_cache(maxsize=128)  
 def ask_deepseek(query, api_key):
     """Send a query directly to DeepSeek via OpenRouter API with caching"""
     headers = {
@@ -654,7 +652,7 @@ def process_direct_query(query):
             if not businesses:
                 return get_generic_business_response(query, city_name, categories)
         else:
-            # Optimization: use a sample instead of all businesses
+            
             businesses = list(BUSINESS_CACHE.values())[:2000]
         
         if categories:
@@ -667,7 +665,7 @@ def process_direct_query(query):
         businesses = [b for b in businesses if "stars" in b and b["stars"] is not None]
         
         if businesses:
-            # Faster sorting
+            
             sorted_businesses = sorted(
                 businesses, 
                 key=lambda x: (float(x.get("stars", 0) or 0), int(x.get("review_count", 0) or 0)), 
@@ -692,7 +690,7 @@ def process_direct_query(query):
         businesses_in_city = get_businesses_by_city(city_name)
         
         if businesses_in_city:
-            # Faster sorting
+            
             sorted_businesses = sorted(
                 businesses_in_city, 
                 key=lambda x: (float(x.get("stars", 0) or 0), int(x.get("review_count", 0) or 0)), 
@@ -719,10 +717,10 @@ def setup_rag_system(yelp_file_path):
     logger.info("Setting up RAG system...")
     
     try:
-        # Use a smaller, faster embedding model
+        
         embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
         
-        # Only use a sample of businesses for RAG to improve speed
+        
         business_ids = list(BUSINESS_CACHE.keys())[:2000]
         
         def process_business(business_id):
@@ -744,7 +742,7 @@ def setup_rag_system(yelp_file_path):
                 }
             )
         
-        # Process in batches for better memory management
+        
         batch_size = 500
         documents = []
         
@@ -754,7 +752,7 @@ def setup_rag_system(yelp_file_path):
                 batch_docs = list(executor.map(process_business, batch_ids))
                 documents.extend(batch_docs)
         
-        # Use a smaller chunk size for faster indexing
+        
         vectorstore = Chroma.from_documents(
             documents=documents, 
             embedding=embeddings
@@ -767,7 +765,7 @@ def setup_rag_system(yelp_file_path):
             temperature=0.7
         )
         
-        # Use a smaller k value for faster retrieval
+        
         chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
             retriever=index.vectorstore.as_retriever(search_kwargs={"k": 3}),
@@ -785,7 +783,7 @@ def process_query(query):
     """Process a query and return a response"""
     global RAG_CHAIN
     
-    # Check if query is people-related (faster than business check)
+    
     if is_people_related_query(query):
         logger.info("Processing people-related question")
         city_name = extract_city_name(query)
@@ -796,7 +794,7 @@ def process_query(query):
             logger.error(f"Error processing people-related question: {str(e)}")
             return {"response": "I'm sorry, I couldn't process your request. Please try again later.", "error": str(e)}
     
-    # Check if query is business-related
+    
     if not is_business_related_query(query):
         logger.info("Processing general question")
         try:
@@ -806,10 +804,10 @@ def process_query(query):
             logger.error(f"Error processing general question: {str(e)}")
             return {"response": "I'm sorry, I couldn't process your request. Please try again later.", "error": str(e)}
     
-    # Set path to data file
+    
     yelp_file_path = "data/dataset.json"
     
-    # Check if data file exists
+    
     if not os.path.exists(yelp_file_path):
         logger.error(f"Data file not found: {yelp_file_path}")
         try:
@@ -819,7 +817,7 @@ def process_query(query):
             logger.error(f"API error: {str(e)}")
             return {"response": "I'm sorry, I couldn't process your request. Please try again later.", "error": str(e)}
     
-    # Initialize cache if not already done
+    
     try:
         if not CACHE_INITIALIZED:
             initialize_cache(yelp_file_path)
@@ -832,7 +830,7 @@ def process_query(query):
             logger.error(f"API error: {str(e2)}")
             return {"response": "I'm sorry, I couldn't process your request. Please try again later.", "error": str(e2)}
     
-    # Try direct query processing first (faster)
+    
     try:
         direct_result = process_direct_query(query)
         if direct_result:
@@ -840,9 +838,9 @@ def process_query(query):
     except Exception as e:
         logger.error(f"Error in direct query processing: {str(e)}")
     
-    # If direct processing didn't work, try RAG approach
+    
     try:
-        # Initialize RAG chain if not already done
+        
         if RAG_CHAIN is None:
             RAG_CHAIN = setup_rag_system(yelp_file_path)
         
@@ -851,21 +849,21 @@ def process_query(query):
             result = RAG_CHAIN.invoke({"question": query, "chat_history": chat_history})
             answer = result["answer"]
             
-            # Check if the response is negative/unhelpful
+            
             if any(phrase in answer.lower() for phrase in NEGATIVE_PHRASES):
                 logger.info("RAG response was not helpful, falling back to DeepSeek")
                 answer = get_generic_business_response(query, extract_city_name(query), extract_categories(query))
             
             return {"response": answer, "type": "rag"}
         else:
-            # Fallback if RAG setup failed
+            
             response = get_generic_business_response(query, extract_city_name(query), extract_categories(query))
             return {"response": response, "type": "fallback", "reason": "rag_setup_failed"}
             
     except Exception as e:
         logger.error(f"Error during RAG processing: {str(e)}")
         
-        # Final fallback
+        
         try:
             response = get_generic_business_response(query, extract_city_name(query), extract_categories(query))
             return {"response": response, "type": "fallback", "reason": "rag_error", "error": str(e)}
@@ -874,7 +872,7 @@ def process_query(query):
             return {"response": "I'm sorry, I couldn't process your request. Please try again with a different query.", "error": str(e2)}
 
 
-# API Routes
+
 
 @app.route('/')
 def home():
@@ -885,9 +883,9 @@ def home():
             <title>Business Recommendation API</title>
             <style>
                 body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-                h1 { color: #333; }
-                code { background-color: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
-                pre { background-color: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; }
+                h1 { color: 
+                code { background-color: 
+                pre { background-color: 
                 .endpoint { margin-bottom: 30px; }
             </style>
         </head>
@@ -939,7 +937,7 @@ def api_query():
         
         result = process_query(query)
         
-        # Add query info to response
+        
         result["query"] = query
         result["status"] = "success"
         
@@ -967,7 +965,7 @@ def simple_query():
         
         result = process_query(query)
         
-        # Add query info to response
+        
         result["query"] = query
         result["status"] = "success"
         
@@ -1010,7 +1008,7 @@ def method_not_allowed(e):
     }), 405
 
 
-# Initialize data on startup
+
 def init_app():
     """Initialize the application data"""
     global CACHE_INITIALIZED, RAG_CHAIN
@@ -1019,10 +1017,10 @@ def init_app():
     
     if os.path.exists(yelp_file_path):
         try:
-            # Initialize cache with a smaller limit for faster startup
+            
             initialize_cache(yelp_file_path, limit=10000)
             
-            # Setup RAG system in a separate thread to avoid blocking startup
+            
             def setup_rag_background():
                 global RAG_CHAIN
                 RAG_CHAIN = setup_rag_system(yelp_file_path)
@@ -1039,13 +1037,13 @@ def init_app():
         logger.warning(f"Data file not found at {yelp_file_path}. Some functionality will be limited.")
 
 
-# Run the Flask app
+
 if __name__ == "__main__":
-    # Initialize data before starting the server
+    
     init_app()
     
-    # Get port from environment variable or use default
+    
     port = int(os.environ.get("PORT", 5000))
     
-    # Run the Flask app
+    
     app.run(host="0.0.0.0", port=port, debug=False)
