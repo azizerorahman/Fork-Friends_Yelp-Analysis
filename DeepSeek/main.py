@@ -11,6 +11,8 @@ import concurrent.futures
 from functools import lru_cache
 import logging
 from tqdm import tqdm
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,6 +29,10 @@ from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
+
+# Initialize Flask app
+app = Flask(__name__)
+CORS(app)
 
 
 class DeepSeekChat(BaseChatModel):
@@ -102,8 +108,9 @@ BUSINESS_CACHE = {}
 CITY_INDEX = defaultdict(set)
 CATEGORY_INDEX = defaultdict(set)
 BUSINESS_ID_TO_CATEGORIES = {}
-OPENROUTER_API_KEY = None
+OPENROUTER_API_KEY = "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"
 CACHE_INITIALIZED = False
+RAG_CHAIN = None
 
 # Precompiled regex patterns for better performance
 CITY_PATTERN1 = re.compile(r"(?:business(?:es)? in|places in|recommend in|suggest in) ([a-zA-Z\s]+)(?:city)?")
@@ -209,7 +216,6 @@ def initialize_cache(yelp_file_path, limit=20000):
         return
     
     logger.info("Initializing business data cache...")
-    print("Loading business data... Please wait...")
     
     # Optimized batch processing
     batch_size = 1000
@@ -262,7 +268,6 @@ def initialize_cache(yelp_file_path, limit=20000):
     logger.info(f"Cache initialized with {len(BUSINESS_CACHE)} businesses")
     logger.info(f"Cities indexed: {len(CITY_INDEX)}")
     logger.info(f"Categories indexed: {len(CATEGORY_INDEX)}")
-    print(f"✓ Loaded {len(BUSINESS_CACHE)} businesses from {len(CITY_INDEX)} cities")
     
     CACHE_INITIALIZED = True
 
@@ -584,7 +589,12 @@ def get_friend_recommendation(query, city_name=None):
     prompt += "Please provide a helpful response with specific suggestions for how they could meet people, "
     prompt += "make friends, or connect with others in this location. Include specific venues, apps, or events "
     prompt += "where possible. If the Yelp dataset might contain relevant community spaces, mention those too. "
+    prompt += "Please provide a concise list of names of friends "
+    prompt += "No additional information or suggestions is necessary—just the names. "
     prompt += "Be conversational and friendly."
+    prompt += "Please provide a helpful response with specific suggestions for how they could meet people, "
+    prompt += "make friends, or connect with others in this location. Include specific venues, apps, or events "
+    prompt += "where possible. If the Yelp dataset might contain relevant community spaces, mention those too. "
     
     return ask_deepseek(prompt, OPENROUTER_API_KEY)
 
@@ -706,7 +716,7 @@ def process_direct_query(query):
 
 def setup_rag_system(yelp_file_path):
     """Set up the RAG system with vectorstore and retrieval chain"""
-    print("Setting up RAG system... This might take a moment.")
+    logger.info("Setting up RAG system...")
     
     try:
         # Use a smaller, faster embedding model
@@ -741,12 +751,7 @@ def setup_rag_system(yelp_file_path):
         for i in range(0, len(business_ids), batch_size):
             batch_ids = business_ids[i:i+batch_size]
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, os.cpu_count() + 4)) as executor:
-                batch_docs = list(tqdm(
-                    executor.map(process_business, batch_ids),
-                    total=len(batch_ids),
-                    desc=f"Creating document vectors (batch {i//batch_size + 1})",
-                    unit="doc"
-                ))
+                batch_docs = list(executor.map(process_business, batch_ids))
                 documents.extend(batch_docs)
         
         # Use a smaller chunk size for faster indexing
@@ -762,78 +767,44 @@ def setup_rag_system(yelp_file_path):
             temperature=0.7
         )
         
-        system_message = """
-        You are a helpful assistant that provides information about businesses from the Yelp dataset.
-        When responding about businesses, please format your response in a clear, numbered list with key details.
-        Include the business name, rating, categories, and address for each business.
-        """
-        
         # Use a smaller k value for faster retrieval
         chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
             retriever=index.vectorstore.as_retriever(search_kwargs={"k": 3}),
         )
         
-        print("✓ RAG system ready")
+        logger.info("RAG system ready")
         return chain
     
     except Exception as e:
         logger.error(f"Error setting up RAG system: {str(e)}")
-        print("❌ Error setting up RAG system. Falling back to direct API calls.")
         return None
 
 
-def main():
-    global OPENROUTER_API_KEY
-    
-    # ASCII art banner for a nicer UI
-    banner = """
-    ╭───────────────────────────────────────╮
-    │  🔍 Business Recommendation Assistant  │
-    ╰───────────────────────────────────────╯
-    """
-    print(banner)
-    
-    # Set API key
-    OPENROUTER_API_KEY = "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"
-    
-    # Get query from command line or prompt user
-    query = None
-    if len(sys.argv) > 1:
-        query = " ".join(sys.argv[1:])
-    else:
-        query = input("What business are you looking for? ")
-    
-    if not query:
-        print("Please provide a query to search for businesses.")
-        sys.exit(1)
-    
-    print(f"\n🔍 Searching for: {query}\n")
+def process_query(query):
+    """Process a query and return a response"""
+    global RAG_CHAIN
     
     # Check if query is people-related (faster than business check)
     if is_people_related_query(query):
-        print("Processing your people-related question...")
+        logger.info("Processing people-related question")
         city_name = extract_city_name(query)
         try:
             response = get_friend_recommendation(query, city_name)
-            print("\n" + response)
-            sys.exit(0)
+            return {"response": response, "type": "people"}
         except Exception as e:
             logger.error(f"Error processing people-related question: {str(e)}")
-            print("I'm sorry, I couldn't process your request. Please try again later.")
-            sys.exit(1)
+            return {"response": "I'm sorry, I couldn't process your request. Please try again later.", "error": str(e)}
     
     # Check if query is business-related
     if not is_business_related_query(query):
-        print("Processing your general question...")
+        logger.info("Processing general question")
         try:
             response = ask_deepseek(query, OPENROUTER_API_KEY)
-            print("\n" + response)
-            sys.exit(0)
+            return {"response": response, "type": "general"}
         except Exception as e:
             logger.error(f"Error processing general question: {str(e)}")
-            print("I'm sorry, I couldn't process your request. Please try again later.")
-            sys.exit(1)
+            return {"response": "I'm sorry, I couldn't process your request. Please try again later.", "error": str(e)}
     
     # Set path to data file
     yelp_file_path = "data/dataset.json"
@@ -841,52 +812,43 @@ def main():
     # Check if data file exists
     if not os.path.exists(yelp_file_path):
         logger.error(f"Data file not found: {yelp_file_path}")
-        print("⚠️ Business data file not found. Using general knowledge instead.")
-        
         try:
             response = ask_deepseek(query, OPENROUTER_API_KEY)
-            print("\n" + response)
+            return {"response": response, "type": "fallback", "reason": "data_file_missing"}
         except Exception as e:
             logger.error(f"API error: {str(e)}")
-            print("I'm sorry, I couldn't process your request. Please try again later.")
-        
-        sys.exit(0)
+            return {"response": "I'm sorry, I couldn't process your request. Please try again later.", "error": str(e)}
     
-    # Initialize cache
+    # Initialize cache if not already done
     try:
-        initialize_cache(yelp_file_path)
+        if not CACHE_INITIALIZED:
+            initialize_cache(yelp_file_path)
     except Exception as e:
         logger.error(f"Error initializing cache: {str(e)}")
-        print("⚠️ Error loading business data. Using general knowledge instead.")
-        
         try:
             response = ask_deepseek(query, OPENROUTER_API_KEY)
-            print("\n" + response)
-        except Exception as e:
-            logger.error(f"API error: {str(e)}")
-            print("I'm sorry, I couldn't process your request. Please try again later.")
-        
-        sys.exit(0)
+            return {"response": response, "type": "fallback", "reason": "cache_init_error", "error": str(e)}
+        except Exception as e2:
+            logger.error(f"API error: {str(e2)}")
+            return {"response": "I'm sorry, I couldn't process your request. Please try again later.", "error": str(e2)}
     
     # Try direct query processing first (faster)
     try:
         direct_result = process_direct_query(query)
         if direct_result:
-            print("\n" + direct_result)
-            sys.exit(0)
+            return {"response": direct_result, "type": "direct"}
     except Exception as e:
         logger.error(f"Error in direct query processing: {str(e)}")
-        print("⚠️ Error processing your query directly.")
     
     # If direct processing didn't work, try RAG approach
-    print("\nSearching for more detailed information...")
-    
     try:
-        chain = setup_rag_system(yelp_file_path)
+        # Initialize RAG chain if not already done
+        if RAG_CHAIN is None:
+            RAG_CHAIN = setup_rag_system(yelp_file_path)
         
-        if chain:
+        if RAG_CHAIN:
             chat_history = []
-            result = chain.invoke({"question": query, "chat_history": chat_history})
+            result = RAG_CHAIN.invoke({"question": query, "chat_history": chat_history})
             answer = result["answer"]
             
             # Check if the response is negative/unhelpful
@@ -894,31 +856,196 @@ def main():
                 logger.info("RAG response was not helpful, falling back to DeepSeek")
                 answer = get_generic_business_response(query, extract_city_name(query), extract_categories(query))
             
-            print("\n" + answer)
+            return {"response": answer, "type": "rag"}
         else:
             # Fallback if RAG setup failed
             response = get_generic_business_response(query, extract_city_name(query), extract_categories(query))
-            print("\n" + response)
+            return {"response": response, "type": "fallback", "reason": "rag_setup_failed"}
             
     except Exception as e:
         logger.error(f"Error during RAG processing: {str(e)}")
-        print("⚠️ I encountered an issue while searching for detailed information.")
         
         # Final fallback
         try:
             response = get_generic_business_response(query, extract_city_name(query), extract_categories(query))
-            print("\n" + response)
+            return {"response": response, "type": "fallback", "reason": "rag_error", "error": str(e)}
         except Exception as e2:
             logger.error(f"Final fallback error: {str(e2)}")
-            print("I'm sorry, I couldn't process your request. Please try again with a different query.")
+            return {"response": "I'm sorry, I couldn't process your request. Please try again with a different query.", "error": str(e2)}
 
 
-if __name__ == "__main__":
+# API Routes
+
+@app.route('/')
+def home():
+    """Home page with simple instructions"""
+    return """
+    <html>
+        <head>
+            <title>Business Recommendation API</title>
+            <style>
+                body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+                h1 { color: #333; }
+                code { background-color: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
+                pre { background-color: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; }
+                .endpoint { margin-bottom: 30px; }
+            </style>
+        </head>
+        <body>
+            <h1>🔍 Business Recommendation API</h1>
+            <p>Welcome to the Business Recommendation API. Use the endpoints below to query business information.</p>
+            
+            <div class="endpoint">
+                <h2>Query Endpoint</h2>
+                <p>Send a POST request to <code>/api/query</code> with a JSON body containing your query:</p>
+                <pre>
+{
+  "query": "Find me the best Italian restaurants in Phoenix"
+}
+                </pre>
+                <p>Example using curl:</p>
+                <pre>curl -X POST http://localhost:5000/api/query -H "Content-Type: application/json" -d '{"query": "Find me the best Italian restaurants in Phoenix"}'</pre>
+            </div>
+            
+            <div class="endpoint">
+                <h2>Simple Query Endpoint</h2>
+                <p>You can also use a GET request with a query parameter:</p>
+                <pre>GET /api/simple-query?q=Find+me+the+best+Italian+restaurants+in+Phoenix</pre>
+                <p>Example in browser: <a href="/api/simple-query?q=Find+me+the+best+Italian+restaurants+in+Phoenix">/api/simple-query?q=Find+me+the+best+Italian+restaurants+in+Phoenix</a></p>
+            </div>
+        </body>
+    </html>
+    """
+
+@app.route('/api/query', methods=['POST'])
+def api_query():
+    """Main API endpoint for processing queries"""
     try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\nSearch cancelled. Goodbye!")
+        data = request.get_json()
+        
+        if not data or 'query' not in data:
+            return jsonify({
+                "error": "Missing query parameter",
+                "status": "error"
+            }), 400
+        
+        query = data['query']
+        
+        if not query or not isinstance(query, str):
+            return jsonify({
+                "error": "Query must be a non-empty string",
+                "status": "error"
+            }), 400
+        
+        result = process_query(query)
+        
+        # Add query info to response
+        result["query"] = query
+        result["status"] = "success"
+        
+        return jsonify(result)
+    
     except Exception as e:
-        logger.error(f"Unhandled exception: {str(e)}")
-        print(f"\n⚠️ Something went wrong: {str(e)}")
-        print("Please try again with a different query or check your internet connection.")
+        logger.error(f"API error: {str(e)}")
+        return jsonify({
+            "error": str(e),
+            "status": "error",
+            "response": "I'm sorry, I encountered an error processing your request."
+        }), 500
+
+@app.route('/api/simple-query', methods=['GET'])
+def simple_query():
+    """Simplified GET endpoint for queries"""
+    try:
+        query = request.args.get('q', '')
+        
+        if not query:
+            return jsonify({
+                "error": "Missing query parameter 'q'",
+                "status": "error"
+            }), 400
+        
+        result = process_query(query)
+        
+        # Add query info to response
+        result["query"] = query
+        result["status"] = "success"
+        
+        return jsonify(result)
+    
+    except Exception as e:
+        logger.error(f"API error: {str(e)}")
+        return jsonify({
+            "error": str(e),
+            "status": "error",
+            "response": "I'm sorry, I encountered an error processing your request."
+        }), 500
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "cache_initialized": CACHE_INITIALIZED,
+        "rag_initialized": RAG_CHAIN is not None,
+        "businesses_loaded": len(BUSINESS_CACHE),
+        "cities_indexed": len(CITY_INDEX),
+        "categories_indexed": len(CATEGORY_INDEX)
+    })
+
+@app.errorhandler(404)
+def not_found(e):
+    """Handle 404 errors"""
+    return jsonify({
+        "error": "Endpoint not found",
+        "status": "error"
+    }), 404
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    """Handle 405 errors"""
+    return jsonify({
+        "error": "Method not allowed",
+        "status": "error"
+    }), 405
+
+
+# Initialize data on startup
+def init_app():
+    """Initialize the application data"""
+    global CACHE_INITIALIZED, RAG_CHAIN
+    
+    yelp_file_path = "data/dataset.json"
+    
+    if os.path.exists(yelp_file_path):
+        try:
+            # Initialize cache with a smaller limit for faster startup
+            initialize_cache(yelp_file_path, limit=10000)
+            
+            # Setup RAG system in a separate thread to avoid blocking startup
+            def setup_rag_background():
+                global RAG_CHAIN
+                RAG_CHAIN = setup_rag_system(yelp_file_path)
+            
+            import threading
+            rag_thread = threading.Thread(target=setup_rag_background)
+            rag_thread.daemon = True
+            rag_thread.start()
+            
+            logger.info("Application initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing application: {str(e)}")
+    else:
+        logger.warning(f"Data file not found at {yelp_file_path}. Some functionality will be limited.")
+
+
+# Run the Flask app
+if __name__ == "__main__":
+    # Initialize data before starting the server
+    init_app()
+    
+    # Get port from environment variable or use default
+    port = int(os.environ.get("PORT", 5000))
+    
+    # Run the Flask app
+    app.run(host="0.0.0.0", port=port, debug=False)
